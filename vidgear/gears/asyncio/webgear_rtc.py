@@ -1,15 +1,11 @@
 """
 ===============================================
 vidgear library source-code is deployed under the Apache 2.0 License:
-
 Copyright (c) 2019-2020 Abhishek Thakur(@abhiTronix) <abhi.una12@gmail.com>
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-
    http://www.apache.org/licenses/LICENSE-2.0
-
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -22,6 +18,8 @@ limitations under the License.
 import os
 import cv2
 import sys
+import time
+import fractions
 import asyncio
 import logging as log
 from collections import deque
@@ -29,11 +27,17 @@ from starlette.routing import Mount, Route
 from starlette.templating import Jinja2Templates
 from starlette.staticfiles import StaticFiles
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse
+from starlette.middleware import Middleware
+from starlette.responses import JSONResponse, PlainTextResponse
 
 from aiortc.rtcrtpsender import RTCRtpSender
-from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+from aiortc import (
+    RTCPeerConnection,
+    RTCSessionDescription,
+    VideoStreamTrack,
+)
 from aiortc.contrib.media import MediaRelay
+from aiortc.mediastreams import MediaStreamError
 from av import VideoFrame
 
 
@@ -46,12 +50,17 @@ from .helper import (
 from ..videogear import VideoGear
 
 # define logger
-logger = log.getLogger("WeGear_RTC")
+logger = log.getLogger("WebGear_RTC")
 if logger.hasHandlers():
     logger.handlers.clear()
 logger.propagate = False
 logger.addHandler(logger_handler())
 logger.setLevel(log.DEBUG)
+
+# add global vars
+VIDEO_CLOCK_RATE = 90000
+VIDEO_PTIME = 1 / 30  # 30fps
+VIDEO_TIME_BASE = fractions.Fraction(1, VIDEO_CLOCK_RATE)
 
 
 class RTC_VideoServer(VideoStreamTrack):
@@ -77,7 +86,6 @@ class RTC_VideoServer(VideoStreamTrack):
     ):
         """
         This constructor method initializes the object state and attributes of the RTC_VideoServer class.
-
         Parameters:
             enablePiCamera (bool): provide access to PiGear(if True) or CamGear(if False) APIs respectively.
             stabilize (bool): enable access to Stabilizer Class for stabilizing frames.
@@ -90,7 +98,7 @@ class RTC_VideoServer(VideoStreamTrack):
             colorspace (str): selects the colorspace of the input stream.
             logging (bool): enables/disables logging.
             time_delay (int): time delay (in sec) before start reading the frames.
-            options (dict): provides ability to alter Tweak Parameters of WeGear_RTC, CamGear, PiGear & Stabilizer.
+            options (dict): provides ability to alter Tweak Parameters of WebGear_RTC, CamGear, PiGear & Stabilizer.
         """
 
         super().__init__()  # don't forget this!
@@ -99,8 +107,8 @@ class RTC_VideoServer(VideoStreamTrack):
         self.__logging = logging
         self.__enable_inf = False  # continue frames even when video ends.
         self.__frame_size_reduction = 20  # 20% reduction
-        self.is_running = True  # check if running
         self.is_launched = False  # check if launched already
+        self.is_running = False  # check if running
 
         if options:
             if "frame_size_reduction" in options:
@@ -146,6 +154,9 @@ class RTC_VideoServer(VideoStreamTrack):
         # initialize blank frame
         self.blank_frame = None
 
+        # handles reset signal
+        self.__reset_enabled = False
+
     def launch(self):
         """
         Launches VideoGear stream
@@ -153,7 +164,34 @@ class RTC_VideoServer(VideoStreamTrack):
         if self.__logging:
             logger.debug("Launching Internal RTC Video-Server")
         self.is_launched = True
+        self.is_running = True
         self.__stream.start()
+
+    async def next_timestamp(self):
+        """
+        VideoStreamTrack internal method for generating accurate timestamp.
+        """
+        # check if ready state not live
+        if self.readyState != "live":
+            # otherwise reset
+            self.stop()
+        if hasattr(self, "_timestamp") and not self.__reset_enabled:
+            self._timestamp += int(VIDEO_PTIME * VIDEO_CLOCK_RATE)
+            wait = self._start + (self._timestamp / VIDEO_CLOCK_RATE) - time.time()
+            await asyncio.sleep(wait)
+        else:
+            if self.__logging:
+                logger.debug(
+                    "{} timestamps".format(
+                        "Resetting" if self.__reset_enabled else "Setting"
+                    )
+                )
+            self._start = time.time()
+            self._timestamp = 0
+            if self.__reset_enabled:
+                self.__reset_enabled = False
+                self.is_running = True
+        return self._timestamp, VIDEO_TIME_BASE
 
     async def recv(self):
         """
@@ -175,7 +213,9 @@ class RTC_VideoServer(VideoStreamTrack):
                 return None
             else:
                 f_stream = self.blank_frame[:]
-            if not self.__enable_inf:
+            if not self.__enable_inf and not self.__reset_enabled:
+                if self.__logging:
+                    logger.debug("Video-Stream Ended.")
                 self.terminate()
         else:
             # create blank
@@ -198,15 +238,20 @@ class RTC_VideoServer(VideoStreamTrack):
         # return `av.frame.Frame`
         return frame
 
+    async def reset(self):
+        """
+        Resets timestamp clock
+        """
+        self.__reset_enabled = True
+        self.is_running = False
+
     def terminate(self):
         """
         Gracefully terminates VideoGear stream
         """
-        # log
         if not (self.__stream is None):
             # terminate running flag
             self.is_running = False
-            self.is_launched = False
             if self.__logging:
                 logger.debug("Terminating Internal RTC Video-Server")
             # terminate
@@ -219,19 +264,15 @@ class WebGear_RTC:
     WebGear_RTC is similar to WeGear API in many aspects but utilizes WebRTC technology under the hood instead of Motion JPEG, which
     makes it suitable for building powerful video-streaming solutions for all modern browsers as well as native clients available on
     all major platforms.
-
     WebGear_RTC is implemented with the help of aiortc library which is built on top of asynchronous I/O framework for Web Real-Time
     Communication (WebRTC) and Object Real-Time Communication (ORTC) and supports many features like SDP generation/parsing, Interactive
     Connectivity Establishment with half-trickle and mDNS support, DTLS key and certificate generation, DTLS handshake, etc.
-
     WebGear_RTC can handle multiple consumers seamlessly and provides native support for ICE (Interactive Connectivity Establishment)
     protocol, STUN (Session Traversal Utilities for NAT), and TURN (Traversal Using Relays around NAT) servers that help us to easily
     establish direct media connection with the remote peers for uninterrupted data flow. It also allows us to define our custom Server
     as a source to manipulate frames easily before sending them across the network(see this doc example).
-
     WebGear_RTC API works in conjunction with Starlette ASGI application and can also flexibly interact with Starlette's ecosystem of
     shared middleware, mountable applications, Response classes, Routing tables, Static Files, Templating engine(with Jinja2), etc.
-
     Additionally, WebGear_RTC API also provides internal wrapper around VideoGear, which itself provides internal access to both
     CamGear and PiGear APIs.
     """
@@ -253,8 +294,7 @@ class WebGear_RTC:
     ):
 
         """
-        This constructor method initializes the object state and attributes of the WeGear_RTC class.
-
+        This constructor method initializes the object state and attributes of the WebGear_RTC class.
         Parameters:
             enablePiCamera (bool): provide access to PiGear(if True) or CamGear(if False) APIs respectively.
             stabilize (bool): enable access to Stabilizer Class for stabilizing frames.
@@ -267,14 +307,14 @@ class WebGear_RTC:
             colorspace (str): selects the colorspace of the input stream.
             logging (bool): enables/disables logging.
             time_delay (int): time delay (in sec) before start reading the frames.
-            options (dict): provides ability to alter Tweak Parameters of WeGear_RTC, CamGear, PiGear & Stabilizer.
+            options (dict): provides ability to alter Tweak Parameters of WebGear_RTC, CamGear, PiGear & Stabilizer.
         """
 
         # initialize global params
         self.__logging = logging
 
         custom_data_location = ""  # path to save data-files to custom location
-        data_path = ""  # path to WeGear_RTC data-files
+        data_path = ""  # path to WebGear_RTC data-files
         overwrite_default = False
         self.__relay = None  # act as broadcaster
 
@@ -288,12 +328,12 @@ class WebGear_RTC:
                 if isinstance(value, str):
                     assert os.access(
                         value, os.W_OK
-                    ), "[WeGear_RTC:ERROR] :: Permission Denied!, cannot write WeGear_RTC data-files to '{}' directory!".format(
+                    ), "[WebGear_RTC:ERROR] :: Permission Denied!, cannot write WebGear_RTC data-files to '{}' directory!".format(
                         value
                     )
                     assert os.path.isdir(
                         os.path.abspath(value)
-                    ), "[WeGear_RTC:ERROR] :: `custom_data_location` value must be the path to a directory and not to a file!"
+                    ), "[WebGear_RTC:ERROR] :: `custom_data_location` value must be the path to a directory and not to a file!"
                     custom_data_location = os.path.abspath(value)
                 else:
                     logger.warning("Skipped invalid `custom_data_location` value!")
@@ -316,7 +356,7 @@ class WebGear_RTC:
                             "enable_infinite_frames"
                         ] = True  # enforce infinite frames
                         logger.critical(
-                            "Enabled live broadcasting with emulated infinite frames."
+                            "Enabled live broadcasting for Peer connection(s)."
                         )
                     else:
                         None
@@ -346,7 +386,7 @@ class WebGear_RTC:
         # log it
         if self.__logging:
             logger.debug(
-                "`{}` is the default location for saving WeGear_RTC data-files.".format(
+                "`{}` is the default location for saving WebGear_RTC data-files.".format(
                     data_path
                 )
             )
@@ -366,6 +406,9 @@ class WebGear_RTC:
                 name="static",
             ),
         ]
+
+        # define middleware support
+        self.middleware = []
 
         # Handle RTC video server
         if source is None:
@@ -391,27 +434,35 @@ class WebGear_RTC:
             )
             # define default frame generator in configuration
             self.config = {"server": self.__default_rtc_server}
-
+            # add exclusive reset connection node
+            self.routes.append(
+                Route("/close_connection", self.__reset_connections, methods=["POST"])
+            )
         # copying original routing tables for further validation
         self.__rt_org_copy = self.routes[:]
-        # keeps check if producer loop should be running
-        self.__isrunning = True
         # collects peer RTC connections
         self.__pcs = set()
 
     def __call__(self):
         """
-        Implements a custom Callable method for WeGear_RTC application.
+        Implements a custom Callable method for WebGear_RTC application.
         """
-        # validate routing tables
         # validate routing tables
         assert not (self.routes is None), "Routing tables are NoneType!"
         if not isinstance(self.routes, list) or not all(
             x in self.routes for x in self.__rt_org_copy
         ):
-            raise RuntimeError("[WeGear_RTC:ERROR] :: Routing tables are not valid!")
+            raise RuntimeError("[WebGear_RTC:ERROR] :: Routing tables are not valid!")
 
-        # validate assigned RTC video-server in WeGear_RTC configuration
+        # validate middlewares
+        assert not (self.middleware is None), "Middlewares are NoneType!"
+        if self.middleware and (
+            not isinstance(self.middleware, list)
+            or not all(isinstance(x, Middleware) for x in self.middleware)
+        ):
+            raise RuntimeError("[WebGear_RTC:ERROR] :: Middlewares are not valid!")
+
+        # validate assigned RTC video-server in WebGear_RTC configuration
         if isinstance(self.config, dict) and "server" in self.config:
             # check if assigned RTC server class is inherit from `VideoStreamTrack` API.i
             if self.config["server"] is None or not issubclass(
@@ -419,7 +470,7 @@ class WebGear_RTC:
             ):
                 # otherwise raise error
                 raise ValueError(
-                    "[WeGear_RTC:ERROR] :: Invalid configuration. {}. Refer Docs for more information!".format(
+                    "[WebGear_RTC:ERROR] :: Invalid configuration. {}. Refer Docs for more information!".format(
                         "Video-Server not assigned"
                         if self.config["server"] is None
                         else "Assigned Video-Server class must be inherit from `aiortc.VideoStreamTrack` only"
@@ -432,12 +483,12 @@ class WebGear_RTC:
             ):
                 # otherwise raise error
                 raise ValueError(
-                    "[WeGear_RTC:ERROR] :: Invalid configuration. Assigned Video-Server Class must have `terminate` method defined. Refer Docs for more information!"
+                    "[WebGear_RTC:ERROR] :: Invalid configuration. Assigned Video-Server Class must have `terminate` method defined. Refer Docs for more information!"
                 )
         else:
             # raise error if validation fails
             raise RuntimeError(
-                "[WeGear_RTC:ERROR] :: Assigned configuration is invalid!"
+                "[WebGear_RTC:ERROR] :: Assigned configuration is invalid!"
             )
         # return Starlette application
         if self.__logging:
@@ -445,6 +496,7 @@ class WebGear_RTC:
         return Starlette(
             debug=(True if self.__logging else False),
             routes=self.routes,
+            middleware=self.middleware,
             exception_handlers=self.__exception_handlers,
             on_shutdown=[self.__on_shutdown],
         )
@@ -477,9 +529,12 @@ class WebGear_RTC:
         async def on_iceconnectionstatechange():
             logger.debug("ICE connection state is %s" % pc.iceConnectionState)
             if pc.iceConnectionState == "failed":
-                logger.error("ICE connection state failed!")
-                await pc.close()
-                self.__pcs.discard(pc)
+                logger.error("ICE connection state failed.")
+                # check if Live Broadcasting is enabled
+                if self.__relay is None:
+                    # if not, close connection.
+                    await pc.close()
+                    self.__pcs.discard(pc)
 
         # Change the remote description associated with the connection.
         await pc.setRemoteDescription(offer)
@@ -529,6 +584,27 @@ class WebGear_RTC:
         return self.__templates.TemplateResponse(
             "500.html", {"request": request}, status_code=500
         )
+
+    async def __reset_connections(self, request):
+        """
+        Resets all connections and recreates VideoServer timestamps
+        """
+        # check if Live Broadcasting is enabled
+        if (
+            self.__relay is None
+            and not (self.__default_rtc_server is None)
+            and (self.__default_rtc_server.is_running)
+        ):
+            logger.critical("Resetting Server")
+            # collects peer RTC connections
+            coros = [pc.close() for pc in self.__pcs]
+            await asyncio.gather(*coros)
+            self.__pcs.clear()
+            await self.__default_rtc_server.reset()
+            return PlainTextResponse("OK")
+        else:
+            # if does, then do nothing
+            return PlainTextResponse("DISABLED")
 
     async def __on_shutdown(self):
         """

@@ -1,15 +1,11 @@
 """
 ===============================================
 vidgear library source-code is deployed under the Apache 2.0 License:
-
 Copyright (c) 2019-2020 Abhishek Thakur(@abhiTronix) <abhi.una12@gmail.com>
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-
    http://www.apache.org/licenses/LICENSE-2.0
-
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -23,12 +19,15 @@ import os
 import cv2
 import pytest
 import asyncio
+import platform
 import logging as log
 import requests
 import tempfile
 import json, time
 from starlette.routing import Route
 from starlette.responses import PlainTextResponse
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
 from starlette.testclient import TestClient
 from aiortc import (
     MediaStreamTrack,
@@ -287,12 +286,18 @@ test_data = [
     },
     {
         "frame_size_reduction": "invalid_value",
-        "overwrite_default_files": True,
-        "enable_infinite_frames": False,
         "enable_live_broadcast": False,
         "custom_data_location": "im_wrong",
     },
-    {"custom_data_location": tempfile.gettempdir()},
+    {
+        "custom_data_location": tempfile.gettempdir(),
+        "enable_infinite_frames": False,
+    },
+    {
+        "overwrite_default_files": True,
+        "enable_live_broadcast": True,
+        "frame_size_reduction": 99,
+    },
 ]
 
 
@@ -306,6 +311,62 @@ def test_webgear_rtc_options(options):
         client = TestClient(web(), raise_server_exceptions=True)
         response = client.get("/")
         assert response.status_code == 200
+        if (
+            not "enable_live_broadcast" in options
+            or options["enable_live_broadcast"] == False
+        ):
+            (offer_pc, data) = get_RTCPeer_payload()
+            response_rtc_answer = client.post(
+                "/offer",
+                data=data,
+                headers={"Content-Type": "application/json"},
+            )
+            params = response_rtc_answer.json()
+            answer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+            run(offer_pc.setRemoteDescription(answer))
+            response_rtc_offer = client.get(
+                "/offer",
+                data=data,
+                headers={"Content-Type": "application/json"},
+            )
+            assert response_rtc_offer.status_code == 200
+            run(offer_pc.close())
+        web.shutdown()
+    except Exception as e:
+        if isinstance(e, AssertionError):
+            logger.exception(str(e))
+        elif isinstance(e, requests.exceptions.Timeout):
+            logger.exceptions(str(e))
+        else:
+            pytest.fail(str(e))
+
+
+test_data = [
+    {
+        "frame_size_reduction": 40,
+    },
+    {
+        "enable_live_broadcast": True,
+        "frame_size_reduction": 40,
+    },
+]
+
+
+@pytest.mark.skipif((platform.system() == "Windows"), reason="Random Failures!")
+@pytest.mark.parametrize("options", test_data)
+def test_webpage_reload(options):
+    """
+    Test for testing WebGear_RTC API against Webpage reload
+    disruptions
+    """
+    web = WebGear_RTC(source=return_testvideo_path(), logging=True, **options)
+    try:
+        # run webgear_rtc
+        client = TestClient(web(), raise_server_exceptions=True)
+        response = client.get("/")
+        assert response.status_code == 200
+
+        # create offer and receive
         (offer_pc, data) = get_RTCPeer_payload()
         response_rtc_answer = client.post(
             "/offer",
@@ -321,15 +382,46 @@ def test_webgear_rtc_options(options):
             headers={"Content-Type": "application/json"},
         )
         assert response_rtc_offer.status_code == 200
+
+        # simulate webpage reload
+        response_rtc_reload = client.post(
+            "/close_connection",
+            data="1",
+        )
+        # close offer
         run(offer_pc.close())
-        web.shutdown()
+        offer_pc = None
+        data = None
+        # verify response
+        logger.debug(response_rtc_reload.text)
+        assert response_rtc_reload.text == "OK", "Test Failed!"
+
+        # recreate offer and continue receive
+        (offer_pc, data) = get_RTCPeer_payload()
+        response_rtc_answer = client.post(
+            "/offer",
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        params = response_rtc_answer.json()
+        answer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+        run(offer_pc.setRemoteDescription(answer))
+        response_rtc_offer = client.get(
+            "/offer",
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        assert response_rtc_offer.status_code == 200
+
+        # shutdown
+        run(offer_pc.close())
     except Exception as e:
-        if isinstance(e, AssertionError):
-            logger.exception(str(e))
-        elif isinstance(e, requests.exceptions.Timeout):
-            logger.exceptions(str(e))
+        if "enable_live_broadcast" in options and isinstance(e, AssertionError):
+            pytest.xfail("Test Passed")
         else:
             pytest.fail(str(e))
+    finally:
+        web.shutdown()
 
 
 test_data_class = [
@@ -351,6 +443,30 @@ def test_webgear_rtc_custom_server_generator(server, result):
     web.config["server"] = server
     client = TestClient(web(), raise_server_exceptions=True)
     web.shutdown()
+
+
+test_data_class = [
+    (None, False),
+    ([Middleware(CORSMiddleware, allow_origins=["*"])], True),
+    ([Route("/hello", endpoint=hello_webpage)], False),  # invalid value
+]
+
+
+@pytest.mark.parametrize("middleware, result", test_data_class)
+def test_webgear_rtc_custom_middleware(middleware, result):
+    """
+    Test for WebGear_RTC API's custom middleware
+    """
+    try:
+        web = WebGear_RTC(source=return_testvideo_path(), logging=True)
+        web.middleware = middleware
+        client = TestClient(web(), raise_server_exceptions=True)
+        response = client.get("/")
+        assert response.status_code == 200
+        web.shutdown()
+    except Exception as e:
+        if result:
+            pytest.fail(str(e))
 
 
 def test_webgear_rtc_routes():
@@ -408,4 +524,5 @@ def test_webgear_rtc_routes_validity():
     web.routes.clear()
     # test
     client = TestClient(web(), raise_server_exceptions=True)
+    # close
     web.shutdown()
